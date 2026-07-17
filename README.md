@@ -75,7 +75,7 @@ local layout are in [`data/DATA_SOURCES.md`](data/DATA_SOURCES.md).
 
 | Dataset | Access |
 |---|---|
-| PPMI (PD + Prodromal phenoconverters) | [ppmi-info.org](https://www.ppmi-info.org) |
+| PPMI | [ppmi-info.org](https://www.ppmi-info.org) |
 
 ## Repository Structure
 
