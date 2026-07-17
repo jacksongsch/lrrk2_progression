@@ -1,0 +1,55 @@
+cff-version: 1.2.0
+title: >-
+  Variant-specific motor symptom progression in
+  LRRK2-associated Parkinson's disease
+message: >-
+  Publication pending. Please cite this repository until
+  the peer-reviewed article is published.
+type: software
+authors:
+  - given-names: Jackson G.
+    family-names: Schumacher
+    email: jgschumacher@mgh.harvard.edu
+    affiliation: >-
+      Department of Neurology, Massachusetts General Hospital
+      and Harvard Medical School; ASAP Collaborative Research
+      Network
+    orcid: 'https://orcid.org/0009-0000-4227-4710'
+  - given-names: Xinyuan
+    family-names: Zhang
+    affiliation: >-
+      Channing Division of Network Medicine, Brigham and
+      Women's Hospital and Harvard Medical School
+    orcid: 'https://orcid.org/0000-0002-2974-8392'
+  - given-names: Jian
+    family-names: Wang
+    affiliation: >-
+      ASAP Collaborative Research Network; Department of
+      Biostatistics, The University of Texas MD Anderson
+      Cancer Center
+    orcid: 'https://orcid.org/0000-0001-7104-0673'
+  - given-names: Xiqun
+    family-names: Chen
+    affiliation: >-
+      Department of Neurology, Massachusetts General Hospital
+      and Harvard Medical School; ASAP Collaborative Research
+      Network
+    orcid: 'https://orcid.org/0000-0001-8582-8891'
+repository-code: 'https://github.com/jacksongsch/lrrk2_progression'
+license: Apache-2.0
+preferred-citation:
+  type: article
+  title: >-
+    Variant-specific motor symptom progression in
+    LRRK2-associated Parkinson's disease
+  authors:
+    - given-names: Jackson G.
+      family-names: Schumacher
+    - given-names: Xinyuan
+      family-names: Zhang
+    - given-names: Jian
+      family-names: Wang
+    - given-names: Xiqun
+      family-names: Chen
+  year: 2026
+  notes: 'Manuscript in preparation'

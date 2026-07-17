@@ -1,0 +1,730 @@
+---
+title: "LRRK2 Progression Analysis"
+author: "Jackson G. Schumacher"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+---
+
+<!-- Produces: Data for Figure 1b, Figure 1c, and Supplemental Tables 1-4 -->
+<!-- Manuscript: Schumacher et al., Variant-specific motor symptom progression in LRRK2-associated Parkinson's disease -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+set.seed(10719L)
+```
+
+```{r packages}
+library(dplyr)
+library(tidyr)
+library(nlme)
+library(ggplot2)
+library(ggtext)
+library(openxlsx)
+library(patchwork)
+```
+
+```{r config}
+config <- list(
+  data    = "Data/LRRK2_Analysis_Ready.xlsx",
+  out_dir = "Output"
+)
+if (!dir.exists(config$out_dir)) dir.create(config$out_dir)
+
+COHORT_LEVELS <- c("SPD", "G2019S", "R1441G_M1646T", "M1646T")
+NOM_P  <- 0.05
+```
+
+```{r helpers}
+# relative difference in slope vs the reference group. |value| > 100 means the group
+# slope has the opposite sign to the reference, i.e. modelled improvement rather than
+# slower decline: report the slope and CI in that case, not this
+pct_diff <- function(bd, ref) {
+  if (is.na(bd) || is.na(ref) || ref == 0) return(NA_real_)
+  round(100 * bd / abs(ref), 1)
+}
+
+fmt_p <- function(p) {
+  if (is.na(p)) return("")
+  if (p < 0.001) return("<0.001")
+  sprintf("%.3f", p)
+}
+
+# control list is global: lme stores its call, so a local ctrl is out of scope
+# by the time update() or anova() re-evaluates it
+LME_CTRL <- list(msMaxIter = 1000, msMaxEval = 1000, opt = "optim")
+
+# LME with fallback: varIdent can fail with unbalanced groups
+safe_lme <- function(formula, data, random, weights = NULL, ...) {
+  tryCatch({
+    if (!is.null(weights))
+      mod <- lme(fixed = formula, random = random, data = data,
+                 weights = weights, control = LME_CTRL, ...)
+    else
+      mod <- lme(fixed = formula, random = random, data = data,
+                 control = LME_CTRL, ...)
+    list(model = mod, success = TRUE, error = NULL, fit = "full")
+  }, error = function(e) {
+    tryCatch({
+      mod <- lme(fixed = formula, random = random, data = data,
+                 control = LME_CTRL, ...)
+      list(model = mod, success = TRUE, error = NULL, fit = "no_varIdent",
+           note = "Simplified (no heteroscedastic variance)")
+    }, error = function(e2) list(model = NULL, success = FALSE, error = e2$message,
+                                 fit = NA_character_))
+  })
+}
+
+# pull a named term from tTable
+pull_term <- function(mod, term) {
+  tt <- summary(mod)$tTable
+  if (!term %in% rownames(tt)) return(NULL)
+  list(b = tt[term, "Value"], se = tt[term, "Std.Error"], p = tt[term, "p-value"])
+}
+
+# extract group slopes from Cohort-interaction LME
+extract_slopes <- function(mr, ref, data) {
+  if (!mr$success) {
+    return(data.frame(Group = NA, N = NA, Slope = NA, SE = NA, CI_lower = NA,
+                      CI_upper = NA, Beta_diff = NA, Beta_SE = NA,
+                      Beta_CI_lower = NA, Beta_CI_upper = NA,
+                      Pct_diff = NA, P_value = NA, Sign_flip = NA,
+                      Fit = NA_character_, Error = mr$error))
+  }
+  mod <- mr$model
+  fit_note <- if (!is.null(mr$fit)) mr$fit else NA_character_
+  fe <- fixef(mod); vm <- vcov(mod); fe_se <- sqrt(diag(vm))
+  ns <- data %>% group_by(Cohort) %>%
+    summarise(N = n_distinct(participant_id), .groups = "drop")
+  ref_slope <- fe["visit_year"]; ref_se <- fe_se["visit_year"]
+
+  lapply(levels(data$Cohort), function(coh) {
+    n <- ns$N[ns$Cohort == coh]
+    if (length(n) == 0) n <- NA
+
+    if (coh == ref) {
+      data.frame(Group = coh, N = n, Slope = ref_slope, SE = ref_se,
+                 CI_lower = ref_slope - 1.96 * ref_se,
+                 CI_upper = ref_slope + 1.96 * ref_se,
+                 Beta_diff = NA_real_, Beta_SE = NA_real_,
+                 Beta_CI_lower = NA_real_, Beta_CI_upper = NA_real_,
+                 Pct_diff = NA_real_, P_value = NA_real_, Sign_flip = FALSE,
+                 Fit = fit_note)
+    } else {
+      # nlme mangles spaces/+ in cohort names
+      cc <- gsub(" ", ".", coh); cc <- gsub("\\+", ".", cc)
+      nms <- c(paste0("visit_year:Cohort", coh), paste0("visit_year:Cohort", cc),
+               paste0("Cohort", coh, ":visit_year"), paste0("Cohort", cc, ":visit_year"))
+      found <- NULL
+      for (nm in nms) if (nm %in% names(fe)) { found <- nm; break }
+
+      if (!is.null(found)) {
+        bd <- fe[found]; bse <- fe_se[found]
+        slope <- ref_slope + bd
+        var_s <- vm["visit_year","visit_year"] + vm[found,found] + 2*vm["visit_year",found]
+        slope_se <- sqrt(max(0, var_s))
+        pv <- tryCatch(summary(mod)$tTable[found, "p-value"], error = function(e) NA_real_)
+        data.frame(Group = coh, N = n, Slope = slope, SE = slope_se,
+                   CI_lower = slope - 1.96 * slope_se,
+                   CI_upper = slope + 1.96 * slope_se,
+                   Beta_diff = bd, Beta_SE = bse,
+                   Beta_CI_lower = bd - 1.96 * bse,
+                   Beta_CI_upper = bd + 1.96 * bse,
+                   Pct_diff = pct_diff(bd, ref_slope), P_value = pv,
+                   Sign_flip = sign(slope) != sign(ref_slope),
+                   Fit = fit_note)
+      } else {
+        data.frame(Group = coh, N = n, Slope = NA, SE = NA, CI_lower = NA,
+                   CI_upper = NA, Beta_diff = NA, Beta_SE = NA,
+                   Beta_CI_lower = NA, Beta_CI_upper = NA,
+                   Pct_diff = NA, P_value = NA)
+      }
+    }
+  }) %>% do.call(rbind, .)
+}
+
+# Wald test: difference between two interaction terms
+contrast_slopes <- function(mr, t1, t2) {
+  if (!mr$success) return(NULL)
+  fe <- fixef(mr$model); vc <- vcov(mr$model)
+  if (!(t1 %in% names(fe)) || !(t2 %in% names(fe))) return(NULL)
+  d  <- fe[t1] - fe[t2]
+  se <- sqrt(vc[t1,t1] + vc[t2,t2] - 2*vc[t1,t2])
+  z  <- d / se
+  data.frame(Contrast = paste(t1, "vs", t2),
+             Diff = d, SE = se,
+             CI_lower = d - 1.96*se, CI_upper = d + 1.96*se,
+             Z = z, P_value = 2*pnorm(abs(z), lower.tail = FALSE))
+}
+
+run_progression <- function(data, outcome, ledd = FALSE, bl_col = NULL) {
+  if (ledd && !("LEDD" %in% names(data)))
+    stop(sprintf("run_progression: ledd = TRUE but no LEDD column for '%s'", outcome))
+
+  ad <- data %>% mutate(Cohort = factor(Cohort, levels = COHORT_LEVELS))
+  if (is.null(bl_col)) {
+    ad <- ad %>% group_by(participant_id) %>%
+      mutate(baseline_score = first(!!sym(outcome), order_by = visit_year)) %>%
+      ungroup()
+    bl_col <- "baseline_score"
+  }
+  req <- c(outcome, "visit_year", bl_col, "Age_onset", "Duration_bl", "Sex", "Race",
+           "Cohort", "participant_id")
+  if (ledd) req <- c(req, "LEDD")
+  ad <- ad %>% filter(if_all(all_of(req), ~ !is.na(.)))
+
+  # center continuous covariates at their means; LEDD at zero
+  ad[[bl_col]] <- ad[[bl_col]] - mean(ad[[bl_col]])
+  ad$Age_onset   <- ad$Age_onset - mean(ad$Age_onset)
+  ad$Duration_bl <- ad$Duration_bl - mean(ad$Duration_bl)
+
+  if (nrow(ad) < 20)
+    return(list(success = FALSE, error = sprintf("Insufficient data: %d obs", nrow(ad))))
+
+  # time interacts with cohort AND covariates. Baseline score (p=0.001), age at onset
+  # (p=0.033), and disease duration at baseline (p=0.048) all predict slope; without
+  # these terms that variance is absorbed by the cohort interactions. Onset and duration
+  # must both be present: onset = baseline age - duration, so one does not proxy the
+  # other. Matches Schumacher et al., eBioMedicine 2025.
+  # LEDD is per-visit, so it is already time-varying and stays a main effect;
+  # slopes are estimated at LEDD = 0.
+  fml <- as.formula(sprintf(
+    "%s ~ visit_year * (Cohort + %s + Age_onset + Duration_bl + Sex + Race)%s",
+    outcome, bl_col, if (ledd) " + LEDD" else ""))
+  mr <- safe_lme(fml, ad, ~ visit_year + 1 | participant_id,
+                 weights = varIdent(form = ~ 1 | Cohort))
+  slopes <- extract_slopes(mr, "SPD", ad)
+  slopes$Include_LEDD <- ledd
+
+  lvls <- levels(ad$Cohort); non_ref <- lvls[lvls != "SPD"]
+  contrasts <- list()
+  for (i in seq_along(non_ref)) for (j in seq_along(non_ref)) {
+    if (j <= i) next
+    cs <- contrast_slopes(mr, paste0("visit_year:Cohort", non_ref[i]),
+                               paste0("visit_year:Cohort", non_ref[j]))
+    if (!is.null(cs)) contrasts[[paste(non_ref[i], "vs", non_ref[j])]] <- cs
+  }
+  contrasts_df <- if (length(contrasts) > 0) do.call(rbind, contrasts) else NULL
+
+  list(success = mr$success, model = mr$model, slopes = slopes,
+       contrasts = contrasts_df, data = ad,
+       n_obs = nrow(ad), n_participants = n_distinct(ad$participant_id),
+       small_sample_warning = if (nrow(ad) < 50) sprintf("Small sample (%d obs)", nrow(ad)))
+}
+
+# shared figure builder for UPDRS III and II
+build_progression_fig <- function(res, y_label, filename, y_limits = NULL) {
+  fdc <- res$data
+  mod <- res$model
+  fe <- fixef(mod); vm <- vcov(mod); tt <- summary(mod)$tTable
+  lvls <- COHORT_LEVELS
+
+  # covariate adjustment at sample means; LEDD at zero if present
+  cov_nms <- intersect(c("baseline_score", "Age_onset", "LEDD"), names(fe))
+  cov_val <- sum(sapply(cov_nms, function(v) fe[v] * mean(fdc[[v]], na.rm = TRUE)))
+
+  yrs <- seq(0, max(fdc$visit_year, na.rm = TRUE), by = 0.5)
+  pg <- expand.grid(visit_year = yrs, Cohort = lvls, stringsAsFactors = FALSE)
+  pg$Cohort <- factor(pg$Cohort, levels = lvls)
+  pg$predicted <- NA_real_; pg$se <- NA_real_
+
+  for (i in 1:nrow(pg)) {
+    t <- pg$visit_year[i]; g <- as.character(pg$Cohort[i])
+    if (g == "SPD") {
+      pg$predicted[i] <- fe["(Intercept)"] + fe["visit_year"]*t + cov_val
+      vp <- vm["(Intercept)","(Intercept)"] + t^2*vm["visit_year","visit_year"] +
+        2*t*vm["(Intercept)","visit_year"]
+    } else {
+      cnm <- paste0("Cohort", g); inm <- paste0("visit_year:Cohort", g)
+      if (!inm %in% names(fe)) inm <- paste0("Cohort", g, ":visit_year")
+      pg$predicted[i] <- fe["(Intercept)"] + fe[cnm] + (fe["visit_year"] + fe[inm])*t + cov_val
+      vp <- vm["(Intercept)","(Intercept)"] + vm[cnm,cnm] +
+        t^2*vm["visit_year","visit_year"] + t^2*vm[inm,inm] +
+        2*vm["(Intercept)",cnm] + 2*t*vm["(Intercept)","visit_year"] +
+        2*t*vm["(Intercept)",inm] + 2*t*vm[cnm,"visit_year"] +
+        2*t*vm[cnm,inm] + 2*t^2*vm["visit_year",inm]
+    }
+    pg$se[i] <- sqrt(max(vp, 0))
+  }
+  pg$ci_lo <- pg$predicted - 1.96*pg$se
+  pg$ci_hi <- pg$predicted + 1.96*pg$se
+
+  obs <- fdc %>%
+    mutate(vy_r = round(visit_year)) %>%
+    group_by(Cohort, vy_r) %>%
+    summarise(mn = mean(score, na.rm = TRUE),
+              se = sd(score, na.rm = TRUE)/sqrt(n()), n = n(), .groups = "drop") %>%
+    filter(n >= 5)
+
+  ns <- fdc %>% group_by(Cohort) %>%
+    summarise(N = n_distinct(participant_id), .groups = "drop")
+  # participants still under follow-up at year t, not those with a visit rounding to t;
+  # the latter drops anyone whose first visit lands past 0.5y and undercounts baseline
+  last_visit <- fdc %>%
+    group_by(Cohort, participant_id) %>%
+    summarise(max_yr = max(visit_year), .groups = "drop")
+  n_tbl <- lapply(0:floor(max(fdc$visit_year, na.rm = TRUE)), function(t) {
+    last_visit %>% group_by(Cohort) %>%
+      summarise(time = t, n = sum(max_yr >= t), .groups = "drop")
+  }) %>% bind_rows() %>% filter(n > 0)
+
+  cols <- c("SPD" = "#2166AC", "G2019S" = "#4DAF4A",
+            "R1441G_M1646T" = "#B2182B", "M1646T" = "#FF7F00")
+  labels <- c("SPD" = "Sporadic", "G2019S" = "G2019S",
+              "R1441G_M1646T" = "R1441G+M1646T", "M1646T" = "M1646T")
+
+  # the annotation box doubles as the legend: colour the group name to match its line
+  key <- function(g) sprintf("<span style='color:%s'>\u25cf <b>%s</b></span>", cols[g], labels[g])
+
+  ref_slope <- fe["visit_year"]
+  stat_lines <- sprintf("%s: %0.2f pts/yr", key("SPD"), ref_slope)
+  for (g in lvls[lvls != "SPD"]) {
+    inm <- paste0("visit_year:Cohort", g)
+    if (!inm %in% names(fe)) inm <- paste0("Cohort", g, ":visit_year")
+    sl <- ref_slope + fe[inm]; pv <- tt[inm, "p-value"]
+    bd <- fe[inm]; bse <- sqrt(diag(vm))[inm]
+    stat_lines <- c(stat_lines,
+      sprintf("%s: %0.2f pts/yr; \u03b2=%0.2f (%0.2f, %0.2f); p=%s",
+              key(g), sl, bd, bd - 1.96*bse, bd + 1.96*bse, fmt_p(pv)))
+  }
+  stat_label <- paste(stat_lines, collapse = "<br>")
+
+  # position_dodge shrinks each errorbar to its slot, so a 0.2 width leaves the caps
+  # sub-pixel with four groups; set the geom width close to the dodge width
+  dodge <- position_dodge(width = 0.6)
+
+  max_yr <- 12
+  p_main <- ggplot() +
+    geom_ribbon(data = pg, aes(visit_year, ymin = ci_lo, ymax = ci_hi, fill = Cohort), alpha = 0.2) +
+    geom_point(data = obs, aes(vy_r, mn, color = Cohort), size = 3, position = dodge) +
+    geom_errorbar(data = obs, aes(vy_r, mn, ymin = mn - 1.96*se, ymax = mn + 1.96*se, color = Cohort),
+                  width = 0.55, linewidth = 0.8, position = dodge) +
+    geom_line(data = pg, aes(visit_year, predicted, color = Cohort), linewidth = 1.5) +
+    annotate("richtext", x = 0.05, y = Inf, label = stat_label, hjust = 0, vjust = 1,
+             size = 3.5, fill = "white", color = "black",
+             label.size = 0.5, label.r = unit(0.15, "lines"),
+             family = "sans") +
+    scale_color_manual(values = cols, labels = labels) +
+    scale_fill_manual(values = cols, labels = labels) +
+    scale_x_continuous(breaks = seq(0, 20, 1), limits = c(0, 12.1),
+                       expand = expansion(mult = c(0.02, 0.05))) +
+    scale_y_continuous(breaks = seq(0, 100, 5), expand = expansion(mult = c(0.02, 0.05))) +
+    labs(x = "Years since Baseline", y = y_label) +
+    theme_classic(base_size = 14) +
+    theme(legend.position = "none",
+          axis.title = element_text(face = "bold"),
+          axis.text = element_text(color = "black"),
+          axis.title.y = element_text(face = "bold", vjust = -14),
+          panel.grid.major = element_line(color = "gray90", linewidth = 0.3),
+          plot.margin = margin(5, 10, -5, 10))
+  if (!is.null(y_limits)) p_main <- p_main + coord_cartesian(ylim = y_limits)
+
+  n_tbl$Cohort <- factor(n_tbl$Cohort, levels = rev(lvls))
+  p_n <- ggplot(n_tbl, aes(x = time, y = Cohort, label = n)) +
+    geom_text(aes(color = Cohort), size = 3.5, fontface = "plain") +
+    scale_color_manual(values = cols, guide = "none") +
+    scale_x_continuous(breaks = seq(0, 12, 1), limits = c(0, 12.1),
+                       expand = expansion(mult = c(0.02, 0.05))) +
+    scale_y_discrete(labels = rev(labels)) +
+    labs(x = NULL, y = NULL) +
+    theme_void(base_size = 11) +
+    theme(axis.text.y = element_text(hjust = 1, face = "bold", color = "gray30",
+                                     margin = margin(r = 10)),
+          axis.text.x = element_blank(),
+          plot.title = element_text(size = 10, face = "bold", hjust = -0.15,
+                                    color = "gray30", margin = margin(b = 3)),
+          plot.margin = margin(-5, 10, 5, 60)) +
+    ggtitle("No. of participants")
+
+  fig <- p_main / p_n + plot_layout(heights = c(8, 1))
+  print(fig)
+  ggsave(file.path(config$out_dir, paste0(filename, ".png")), fig, width = 8, height = 6, dpi = 600)
+  ggsave(file.path(config$out_dir, paste0(filename, ".pdf")), fig, width = 8, height = 6, device = cairo_pdf)
+  fig
+}
+```
+
+## Data
+
+```{r load}
+load_sheet <- function(sheet) {
+  d <- read.xlsx(config$data, sheet = sheet)
+  if ("Cohort" %in% names(d)) d$Cohort <- factor(d$Cohort, levels = COHORT_LEVELS)
+  if ("Sex" %in% names(d))    d$Sex <- factor(d$Sex, levels = c("Female", "Male"))
+  if ("Race" %in% names(d))   d$Race <- factor(d$Race, levels = c("White", "Other"))
+  d
+}
+
+dem <- load_sheet("Participants")
+valid_ids <- as.character(dem$PATNO)
+
+load_clinical <- function(sheet) {
+  d <- load_sheet(sheet)
+  if ("participant_id" %in% names(d)) d <- d %>% filter(participant_id %in% valid_ids)
+  d
+}
+
+d_u3    <- load_clinical("UPDRS_III_OFF")
+d_u1    <- load_clinical("UPDRS_I")
+d_u2    <- load_clinical("UPDRS_II")
+d_u4    <- load_clinical("UPDRS_IV")
+d_moca  <- tryCatch(load_clinical("MoCA"), error = function(e) NULL)
+d_dat_c <- tryCatch(load_clinical("DAT_Caudate"), error = function(e) NULL)
+d_dat_p <- tryCatch(load_clinical("DAT_Putamen"), error = function(e) NULL)
+
+cat(sprintf("Participants: %d\n", nrow(dem)))
+table(dem$Cohort)
+cat(sprintf("\nUPDRS III OFF: %d obs, %d participants\n",
+            nrow(d_u3), n_distinct(d_u3$participant_id)))
+```
+
+## MDS-UPDRS III OFF
+
+```{r primary-updrs3}
+res_u3 <- run_progression(d_u3, "score", ledd = TRUE, bl_col = "baseline_score")
+if (res_u3$success) {
+  cat(sprintf("N = %d participants, %d observations\n", res_u3$n_participants, res_u3$n_obs))
+  print(res_u3$slopes %>% select(Group, N, Slope, Pct_diff, P_value, Include_LEDD) %>%
+          mutate(Slope = round(Slope, 2), P_value = sapply(P_value, fmt_p)))
+  cat("\nPairwise contrasts:\n")
+  print(res_u3$contrasts)
+}
+```
+
+## Subscores
+
+```{r subscores}
+sub_vars <- c("tremor_score", "rigidity_score", "bradykinesia_score",
+              "axial_score", "bulbar_score", "pigd_score")
+
+run_subscore <- function(data, sub_vars, ledd = TRUE) {
+  results <- list()
+  for (sub in sub_vars) {
+    lbl <- gsub("_score", "", sub)
+    bl <- paste0("bl_", sub)
+
+    sd <- data %>%
+      filter(!is.na(.data[[sub]])) %>%
+      mutate(Cohort = factor(Cohort, levels = COHORT_LEVELS)) %>%
+      group_by(participant_id) %>%
+      mutate(!!bl := first(.data[[sub]], order_by = visit_year)) %>%
+      ungroup()
+
+    req <- c(sub, "visit_year", bl, "Age_onset", "Duration_bl", "Sex", "Race",
+             "Cohort", "participant_id")
+    if (ledd) req <- c(req, "LEDD")
+    sd <- sd %>% filter(if_all(all_of(req), ~ !is.na(.)))
+
+    sd[[bl]] <- sd[[bl]] - mean(sd[[bl]])
+    sd$Age_onset   <- sd$Age_onset - mean(sd$Age_onset)
+    sd$Duration_bl <- sd$Duration_bl - mean(sd$Duration_bl)
+
+    # same specification as run_progression: time interacted with covariates
+    fml <- as.formula(sprintf(
+      "%s ~ visit_year * (Cohort + %s + Age_onset + Duration_bl + Sex + Race)%s",
+      sub, bl, if (ledd) " + LEDD" else ""))
+
+    # random slope can fail for low-variance subscores (tremor, bulbar). Track which
+    # branch was taken: an intercept-only fit cannot estimate a per-participant slope
+    # and its group slopes are not comparable to the full-fit subscores.
+    fit_note <- "full"
+    fit <- tryCatch({
+      lme(fml, random = ~ visit_year | participant_id, data = sd,
+          weights = varIdent(form = ~ 1 | Cohort), control = LME_CTRL)
+    }, error = function(e) {
+      fit_note <<- "no_varIdent"
+      tryCatch(
+        lme(fml, random = ~ visit_year | participant_id, data = sd, control = LME_CTRL),
+        error = function(e2) {
+          fit_note <<- "intercept_only"
+          tryCatch(
+            lme(fml, random = ~ 1 | participant_id, data = sd, control = LME_CTRL),
+            error = function(e3) { fit_note <<- NA_character_; NULL })
+        })
+    })
+
+    if (!is.null(fit)) {
+      mr <- list(model = fit, success = TRUE, error = NULL, fit = fit_note)
+      slopes <- extract_slopes(mr, "SPD", sd)
+      slopes$Subscore <- lbl
+      slopes$LEDD_adjusted <- ledd
+      results[[lbl]] <- slopes
+    }
+  }
+  if (length(results) > 0) do.call(rbind, results) else data.frame()
+}
+
+sub_df <- run_subscore(d_u3, sub_vars, ledd = TRUE)
+
+if (nrow(sub_df) > 0) {
+  # which subscores fell back to a simpler random-effects structure
+  cat("Random-effects structure by subscore:\n")
+  print(sub_df %>% distinct(Subscore, Fit) %>% as.data.frame())
+
+  # a group slope with the opposite sign to the reference means modelled improvement,
+  # not slower decline; Pct_diff is meaningless there
+  flips <- sub_df %>% filter(!is.na(Sign_flip), Sign_flip)
+  if (nrow(flips) > 0) {
+    cat("\nWARNING: slope sign differs from reference (report Slope and CI, not Pct_diff):\n")
+    print(flips %>% select(Subscore, Group, N, Slope, CI_lower, CI_upper, P_value) %>%
+            mutate(across(c(Slope, CI_lower, CI_upper), ~ round(.x, 3))) %>%
+            as.data.frame())
+  }
+
+  cat("\n")
+  print(sub_df %>%
+          mutate(across(c(Slope, CI_lower, CI_upper), ~ round(.x, 3))) %>%
+          select(Subscore, Group, N, Slope, CI_lower, CI_upper, Pct_diff, P_value) %>%
+          arrange(Subscore, P_value))
+}
+```
+
+## MDS-UPDRS II
+
+```{r updrs2}
+res_u2 <- run_progression(d_u2, "score", ledd = FALSE, bl_col = "baseline_score")
+if (res_u2$success)
+  print(res_u2$slopes %>% select(Group, N, Slope, Pct_diff, P_value) %>%
+          mutate(Slope = round(Slope, 2), P_value = sapply(P_value, fmt_p)))
+```
+
+## Secondary Outcomes
+
+```{r secondary}
+run_sec <- function(data, label, ledd = FALSE) {
+  r <- run_progression(data, "score", ledd, "baseline_score")
+  if (r$success) {
+    res <- r$slopes %>% mutate(Outcome = label)
+    print(res %>% select(Outcome, Group, N, Slope, Pct_diff, P_value) %>%
+            mutate(Slope = round(Slope, 3), P_value = sapply(P_value, fmt_p)))
+    res
+  } else NULL
+}
+
+u1_res   <- run_sec(d_u1, "MDS-UPDRS I")
+u4_res   <- run_sec(d_u4, "MDS-UPDRS IV")
+moca_res <- if (!is.null(d_moca)) run_sec(d_moca, "MoCA") else NULL
+dat_c_res <- if (!is.null(d_dat_c)) run_sec(d_dat_c, "DAT-SPECT Caudate") else NULL
+dat_p_res <- if (!is.null(d_dat_p)) run_sec(d_dat_p, "DAT-SPECT Putamen") else NULL
+
+sec_all <- bind_rows(
+  if (res_u2$success) res_u2$slopes %>% mutate(Outcome = "MDS-UPDRS II") else NULL,
+  u1_res, u4_res, moca_res, dat_c_res, dat_p_res)
+```
+
+## Sensitivity Analyses
+
+```{r sensitivity}
+# Positive vs Non-positive: Inconclusive and Unavailable are grouped with Negative
+saa_lookup <- dem %>% select(PATNO, SAA) %>%
+  mutate(SAA = factor(if_else(SAA == "Positive", "Positive", "Non-positive"),
+                      levels = c("Positive", "Non-positive")))
+
+d_u3_saa <- d_u3 %>%
+  left_join(saa_lookup, by = c("participant_id" = "PATNO")) %>%
+  mutate(Cohort = factor(Cohort, levels = COHORT_LEVELS)) %>%
+  filter(!is.na(score), !is.na(baseline_score), !is.na(Age_onset), !is.na(Duration_bl),
+         !is.na(Sex), !is.na(Race), !is.na(LEDD), !is.na(SAA)) %>%
+  mutate(baseline_score = baseline_score - mean(baseline_score),
+         Age_onset   = Age_onset - mean(Age_onset),
+         Duration_bl = Duration_bl - mean(Duration_bl))
+
+# SAA-adjusted, additive
+mr_saa <- safe_lme(
+  score ~ visit_year * (Cohort + baseline_score + Age_onset + Duration_bl + Sex + Race + SAA) + LEDD,
+  d_u3_saa, ~ visit_year + 1 | participant_id,
+  weights = varIdent(form = ~ 1 | Cohort))
+
+saa_slopes <- NULL
+if (mr_saa$success) {
+  saa_slopes <- extract_slopes(mr_saa, "SPD", d_u3_saa) %>%
+    mutate(Analysis = "SAA-adjusted")
+  cat("SAA-adjusted:\n")
+  print(saa_slopes %>% select(Group, N, Slope, Beta_diff, Pct_diff, P_value) %>%
+          mutate(across(c(Slope, Beta_diff), ~ round(.x, 2)),
+                 P_value = sapply(P_value, fmt_p)))
+}
+
+# The additive model assumes a common SAA effect across cohorts. It is rejected
+# (LRT vs SAA x Cohort, p<0.0001): the SAA effect is concentrated in the haplotype
+# carriers, consistent with Schumacher et al., eBioMedicine 2025. Report the
+# interaction rather than relying on the adjustment.
+mr_saa_int <- safe_lme(
+  score ~ visit_year * (Cohort * SAA + baseline_score + Age_onset + Duration_bl + Sex + Race) + LEDD,
+  d_u3_saa, ~ visit_year + 1 | participant_id,
+  weights = varIdent(form = ~ 1 | Cohort))
+
+if (mr_saa$success && mr_saa_int$success) {
+  ml_a <- safe_lme(
+    score ~ visit_year * (Cohort + baseline_score + Age_onset + Duration_bl + Sex + Race + SAA) + LEDD,
+    d_u3_saa, ~ visit_year + 1 | participant_id,
+    weights = varIdent(form = ~ 1 | Cohort), method = "ML")
+  ml_i <- safe_lme(
+    score ~ visit_year * (Cohort * SAA + baseline_score + Age_onset + Duration_bl + Sex + Race) + LEDD,
+    d_u3_saa, ~ visit_year + 1 | participant_id,
+    weights = varIdent(form = ~ 1 | Cohort), method = "ML")
+  if (ml_a$success && ml_i$success) {
+    cat("\nLRT, additive SAA vs SAA x Cohort:\n")
+    print(anova(ml_a$model, ml_i$model))
+  }
+  tt_i <- summary(mr_saa_int$model)$tTable
+  keep <- grepl("visit_year", rownames(tt_i)) & grepl("SAA", rownames(tt_i))
+  cat("\nSAA x slope terms:\n")
+  print(round(tt_i[keep, c("Value", "Std.Error", "p-value"), drop = FALSE], 3))
+}
+
+# 5.5-year follow-up cap: isolates the window before the carrier groups thin out
+d_u3_5yr <- d_u3 %>% filter(visit_year <= 5.5)
+res_5yr <- run_progression(d_u3_5yr, "score", ledd = TRUE, bl_col = "baseline_score")
+if (res_5yr$success) {
+  cat("\n5.5-year cap:\n")
+  print(res_5yr$slopes %>% select(Group, N, Slope, Beta_diff, Pct_diff, P_value) %>%
+          mutate(across(c(Slope, Beta_diff), ~ round(.x, 2)),
+                 P_value = sapply(P_value, fmt_p)))
+}
+
+sens_results <- list()
+if (!is.null(saa_slopes)) sens_results[["SAA-adjusted"]] <- saa_slopes
+if (res_5yr$success) sens_results[["5.5-year cap"]] <- res_5yr$slopes %>% mutate(Analysis = "5.5-year cap")
+```
+
+## Figures
+
+```{r figure 1b, fig.width=8, fig.height=6}
+fig_u3 <- build_progression_fig(res_u3, "MDS-UPDRS III Score",
+                                 "fig1b_updrs3_progression", y_limits = c(10, 60))
+```
+
+```{r figure 1c, fig.width=8, fig.height=6}
+fig_u2 <- build_progression_fig(res_u2, "MDS-UPDRS II Score",
+                                 "fig1c_updrs2_progression")
+```
+## Supplemental Table 1
+
+```{r stable1}
+u3_summ <- d_u3 %>%
+  group_by(participant_id, Cohort) %>%
+  summarise(bl_updrs3 = first(score, order_by = visit_year),
+            bl_ledd = first(LEDD, order_by = visit_year),
+            max_fu = max(visit_year, na.rm = TRUE), .groups = "drop") %>%
+  mutate(on_med = !is.na(bl_ledd) & bl_ledd > 0)
+
+moca_summ <- if (!is.null(d_moca)) {
+  d_moca %>% group_by(participant_id, Cohort) %>%
+    summarise(bl_moca = first(score, order_by = visit_year), .groups = "drop")
+} else NULL
+
+dem_tbl <- dem %>%
+  rename(participant_id = PATNO) %>%
+  left_join(u3_summ, by = c("participant_id", "Cohort"))
+if (!is.null(moca_summ))
+  dem_tbl <- dem_tbl %>% left_join(moca_summ, by = c("participant_id", "Cohort"))
+
+dem_tbl <- dem_tbl %>%
+  mutate(
+    SAA_pos     = SAA == "Positive",
+    SAA_neg     = SAA == "Negative",
+    SAA_unavail = !SAA %in% c("Positive", "Negative")
+  )
+
+build_col <- function(d) {
+  n <- nrow(d)
+  pct <- function(x) sprintf("%d (%.1f%%)", sum(x, na.rm = TRUE), 100 * mean(x, na.rm = TRUE))
+  mn_sd <- function(x) {
+    x <- x[!is.na(x)]; if (!length(x)) return("\u2014")
+    sprintf("%.1f \u00b1 %.1f", mean(x), sd(x))
+  }
+  saa_pos_n <- sum(d$SAA_pos, na.rm = TRUE)
+  saa_neg_n <- sum(d$SAA_neg, na.rm = TRUE)
+  saa_known <- saa_pos_n + saa_neg_n
+
+  c(N = as.character(n),
+    `Age at PD onset (years)` = mn_sd(d$Age_onset),
+    `Disease duration at baseline (years)` = mn_sd(d$Duration_bl),
+    Male = pct(d$Sex == "Male"),
+    Race = "",
+    `  Asian` = pct(d$Race_detail == "Asian"),
+    `  Black` = pct(d$Race_detail == "Black"),
+    `  White` = pct(d$Race_detail == "White"),
+    `  Unknown/Multiracial` = pct(d$Race_detail %in% c("Unknown", "Multiracial")),
+    `Average follow-up (years)` = mn_sd(d$max_fu),
+    `MDS-UPDRS III at baseline` = mn_sd(d$bl_updrs3),
+    `MoCA at baseline` = if ("bl_moca" %in% names(d)) mn_sd(d$bl_moca) else "\u2014",
+    `On PD medication at baseline` = pct(d$on_med),
+    `DBS treatment` = pct(d$DBS),
+    `SAA status` = "",
+    `  Positive` = pct(d$SAA_pos),
+    `  Negative` = pct(d$SAA_neg),
+    `  Unavailable` = pct(d$SAA_unavail),
+    `SAA positivity` = if (saa_known > 0)
+      sprintf("%d/%d (%.1f%%)", saa_pos_n, saa_known, 100*saa_pos_n/saa_known) else "\u2014")
+}
+
+cohorts <- list(
+  SPD = dem_tbl %>% filter(Cohort == "SPD"),
+  G2019S = dem_tbl %>% filter(Cohort == "G2019S"),
+  `R1441G+M1646T` = dem_tbl %>% filter(Cohort == "R1441G_M1646T"),
+  M1646T = dem_tbl %>% filter(Cohort == "M1646T"),
+  All = dem_tbl)
+
+stable1 <- data.frame(Characteristic = names(build_col(dem_tbl)))
+for (cn in names(cohorts)) stable1[[cn]] <- build_col(cohorts[[cn]])
+print(knitr::kable(stable1, caption = "Supplemental Table 1"))
+```
+
+## Output
+
+```{r output}
+fmt_out <- function(df) {
+  df %>%
+    mutate(across(where(is.numeric) & matches("Slope|Beta|SE|CI|Diff"), ~ round(., 3)),
+           across(where(is.numeric) & matches("P_value"), ~ round(., 4)))
+}
+
+wb <- createWorkbook()
+addWorksheet(wb, "Supplemental Table 1"); writeData(wb, "Supplemental Table 1", stable1)
+addWorksheet(wb, "UPDRS3"); writeData(wb, "UPDRS3", fmt_out(res_u3$slopes))
+if (!is.null(res_u3$contrasts)) {
+  addWorksheet(wb, "UPDRS3_Contrasts"); writeData(wb, "UPDRS3_Contrasts", fmt_out(res_u3$contrasts))
+}
+if (nrow(sub_df) > 0) { addWorksheet(wb, "UPDRS3_Subscores"); writeData(wb, "UPDRS3_Subscores", fmt_out(sub_df)) }
+
+outcome_sheets <- c("MDS-UPDRS II" = "UPDRS2", "MDS-UPDRS I" = "UPDRS1",
+                     "MDS-UPDRS IV" = "UPDRS4", "MoCA" = "MoCA",
+                     "DAT-SPECT Caudate" = "DAT_Caudate", "DAT-SPECT Putamen" = "DAT_Putamen")
+for (ol in names(outcome_sheets)) {
+  sn <- outcome_sheets[ol]
+  rows <- sec_all %>% filter(Outcome == ol)
+  if (nrow(rows) > 0) { addWorksheet(wb, sn); writeData(wb, sn, fmt_out(rows)) }
+}
+
+if (length(sens_results) > 0) {
+  addWorksheet(wb, "Sensitivity"); writeData(wb, "Sensitivity", fmt_out(bind_rows(sens_results)))
+}
+
+saveWorkbook(wb, file.path(config$out_dir, paste0("LRRK2_Results_", Sys.Date(), ".xlsx")), overwrite = TRUE)
+```
+
+## Summary
+
+```{r summary}
+table(dem$Cohort)
+pm <- res_u3$slopes %>% filter(Group == "R1441G_M1646T")
+ps <- res_u3$slopes %>% filter(Group == "SPD")
+pg <- res_u3$slopes %>% filter(Group == "G2019S")
+if (nrow(pm) > 0 && nrow(ps) > 0)
+  cat(sprintf("SPD: %.2f pts/yr | R1441G+M1646T: %.2f pts/yr | diff=%.2f (%.1f%%), p=%s\n",
+              ps$Slope, pm$Slope, pm$Beta_diff, pm$Pct_diff, fmt_p(pm$P_value)))
+if (nrow(pg) > 0 && nrow(ps) > 0)
+  cat(sprintf("SPD: %.2f pts/yr | G2019S: %.2f pts/yr | diff=%.2f (%.1f%%), p=%s\n",
+              ps$Slope, pg$Slope, pg$Beta_diff, pg$Pct_diff, fmt_p(pg$P_value)))
+```
+
+```{r session}
+sessionInfo()
+```

@@ -1,0 +1,545 @@
+---
+title: "LRRK2 Progression Data Prep"
+author: "Jackson G. Schumacher"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+---
+
+<!-- Produces: LRRK2_Analysis_Ready.xlsx -->
+<!-- Manuscript: Schumacher et al., Variant-specific motor symptom progression in LRRK2-associated Parkinson's disease -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+```
+
+```{r packages}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(openxlsx)
+```
+
+```{r config}
+config <- list(
+  data     = "Data/LRRK2_PPMI_Dataset.xlsx",
+  ledd_csv = "Data/LEDD_Concomitant_Medication_Log_30Jun2026.csv",
+  dem_csv  = "Data/Demographics_30Jun2026.csv",
+  saa_csv  = "Data/SAA_Biospecimen_Analysis_Results_01Jul2026.csv",
+  proc_csv = "Data/Procedure_for_PD_Log_30Jun2026.csv",
+  out      = "Data/LRRK2_Analysis_Ready.xlsx"
+)
+if (!dir.exists("Output")) dir.create("Output")
+
+SH <- list(
+  participants = "Participants",
+  updrs3 = "UPDRS_III", updrs1 = "UPDRS_I",
+  updrs2 = "UPDRS_II",  updrs4 = "UPDRS_IV",
+  moca   = "MoCA",      dat    = "DAT_SPECT",
+  wgs    = "WGS_LRRK2"
+)
+
+COHORT_LEVELS <- c("SPD", "G2019S", "R1441G_M1646T", "M1646T")
+VALID_STATUS  <- c("Enrolled", "Complete", "Withdrew", "Withdraw Deceased")
+MAX_YEAR <- 12
+```
+
+```{r helpers}
+parse_my <- function(s) {
+  if (is.na(s) || !nzchar(trimws(s))) return(NA_integer_)
+  parts <- strsplit(trimws(s), "/")[[1]]
+  if (length(parts) != 2) return(NA_integer_)
+  as.integer(parts[2]) * 12L + as.integer(parts[1])
+}
+parse_my_vec <- Vectorize(parse_my)
+
+# per-visit LEDD: strict stop boundary, COMT multipliers applied to concurrent LD
+compute_visit_ledd <- function(visit_months, patnos, ledd_log) {
+  log <- ledd_log %>%
+    mutate(
+      start_m  = parse_my_vec(STARTDT),
+      stop_m   = parse_my_vec(STOPDT),
+      ledd_num = suppressWarnings(as.numeric(LEDD)),
+      is_mult  = grepl("^LD x", LEDD, ignore.case = TRUE),
+      mult_val = ifelse(is_mult,
+                        suppressWarnings(as.numeric(sub("LD x\\s*", "", LEDD))),
+                        NA_real_),
+      trt_up   = toupper(LEDTRT),
+      is_ld    = grepl(paste0("LEVODOPA|SINEMET|CARBIDOPA|STALEVO|MADOPAR|",
+                              "DUOPA|DUODOPA|RYTARY|INBRIJA|CORBILTA"), trt_up)
+    )
+
+  out <- numeric(length(visit_months))
+  for (i in seq_along(visit_months)) {
+    vm  <- visit_months[i]
+    pid <- as.character(patnos[i])
+    if (is.na(vm)) { out[i] <- NA_real_; next }
+
+    act <- log %>%
+      filter(PATNO == pid, !is.na(start_m),
+             start_m <= vm, is.na(stop_m) | stop_m > vm)
+
+    dir   <- act %>% filter(!is.na(ledd_num), !is_mult)
+    mults <- act %>% filter(is_mult, !is.na(mult_val))
+
+    d_total  <- sum(dir$ledd_num, na.rm = TRUE)
+    ld_total <- sum(dir$ledd_num[dir$is_ld], na.rm = TRUE)
+    m_sum    <- sum(mults$mult_val, na.rm = TRUE)
+
+    out[i] <- d_total + ld_total * m_sum
+  }
+  round(out, 1)
+}
+
+compute_subscores <- function(df) {
+  df %>% mutate(
+    tremor_score = rowSums(select(., NP3PTRMR, NP3PTRML, NP3KTRMR, NP3KTRML,
+                                   NP3RTARU, NP3RTALU, NP3RTARL, NP3RTALL,
+                                   NP3RTALJ, NP3RTCON), na.rm = FALSE),
+    rigidity_score = rowSums(select(., NP3RIGN, NP3RIGRU, NP3RIGLU,
+                                     NP3RIGRL, NP3RIGLL), na.rm = FALSE),
+    bradykinesia_score = rowSums(select(., NP3FTAPR, NP3FTAPL, NP3HMOVR,
+                                         NP3HMOVL, NP3PRSPR, NP3PRSPL,
+                                         NP3TTAPR, NP3TTAPL, NP3LGAGR,
+                                         NP3LGAGL, NP3RISNG, NP3BRADY),
+                                 na.rm = FALSE),
+    axial_score = rowSums(select(., NP3GAIT, NP3FRZGT, NP3PSTBL, NP3POSTR),
+                          na.rm = FALSE),
+    bulbar_score = rowSums(select(., NP3SPCH, NP3FACXP), na.rm = FALSE),
+    pigd_score = rowSums(select(., NP3GAIT, NP3FRZGT, NP3PSTBL), na.rm = FALSE)
+  )
+}
+```
+
+## Participants
+
+```{r participants}
+dem_raw <- read_excel(config$data, sheet = SH$participants)
+dem_raw$PATNO <- as.character(dem_raw$PATNO)
+
+flow <- list()
+flow$total <- nrow(dem_raw)
+
+dem <- dem_raw %>% filter(Enrollment_Status %in% VALID_STATUS)
+flow$valid_status <- nrow(dem)
+
+# SWEDD excluded; phenoconversion only from Prodromal
+dem <- dem %>%
+  filter(PPMI_Cohort == "Parkinson's Disease" |
+         (Phenoconverted == 1 & PPMI_Cohort == "Prodromal"))
+flow$pd <- nrow(dem)
+
+dem <- dem %>% filter(Has_WGS == 1)
+flow$has_wgs <- nrow(dem)
+
+# WGS variant profiles drive LRRK2 cohort assignment
+wgs_detail <- read_excel(config$data, sheet = SH$wgs)
+wgs_detail$PATNO <- sub("^PP-", "", as.character(wgs_detail$PATNO))
+
+wgs_profile <- wgs_detail %>%
+  group_by(PATNO) %>%
+  summarise(
+    has_G2019S = any(LRRK2_Variant == "G2019S"),
+    has_R1441G = any(LRRK2_Variant == "R1441G"),
+    has_R1441C = any(LRRK2_Variant == "R1441C"),
+    has_M1646T = any(LRRK2_Variant == "M1646T"),
+    G2019S_dosage = max(as.numeric(Dosage[LRRK2_Variant == "G2019S"]), na.rm = TRUE),
+    .groups = "drop"
+  )
+wgs_profile$G2019S_dosage[is.infinite(wgs_profile$G2019S_dosage)] <- NA
+
+dem <- dem %>%
+  left_join(wgs_profile, by = "PATNO") %>%
+  mutate(across(starts_with("has_"), ~ replace_na(., FALSE)))
+
+excl_genes <- c("Consensus_GBA", "Consensus_SNCA", "Consensus_PRKN",
+                "Consensus_PINK1", "Consensus_PARK7", "Consensus_VPS35")
+dem$has_excl <- rowSums(
+  sapply(excl_genes, function(col) {
+    dem[[col]] != "0" & dem[[col]] != "NA" & !is.na(dem[[col]])
+  })
+) > 0
+flow$excl_other_gene <- sum(dem$has_excl)
+dem <- dem %>% filter(!has_excl) %>% select(-has_excl)
+flow$after_gene_excl <- nrow(dem)
+
+# WGS-first; consensus supplements carriers absent from WGS caller output
+dem <- dem %>%
+  mutate(
+    G2019S_homozygous = (has_G2019S & !is.na(G2019S_dosage) & G2019S_dosage == 2) |
+                         Consensus_LRRK2 == "G2019S/G2019S",
+    Cohort = case_when(
+      has_G2019S ~ "G2019S",
+      has_R1441G & has_M1646T ~ "R1441G_M1646T",
+      has_R1441C & !has_M1646T ~ NA_character_,
+      has_M1646T ~ "M1646T",
+      Consensus_LRRK2 %in% c("G2019S", "G2019S/G2019S") ~ "G2019S",
+      Consensus_LRRK2 %in% c("R1441G") ~ "R1441G_M1646T",
+      Consensus_LRRK2 != "0" & !is.na(Consensus_LRRK2) &
+        Consensus_LRRK2 != "NA" ~ NA_character_,
+      TRUE ~ "SPD"
+    ),
+    Cohort = factor(Cohort, levels = COHORT_LEVELS),
+    Sex    = factor(Sex, levels = c("Female", "Male")),
+    Race   = factor(if_else(Race == "White", "White", "Other"),
+                    levels = c("White", "Other"))
+  ) %>%
+  filter(!is.na(Cohort))
+flow$final <- nrow(dem)
+
+# ENROLL_AGE is age at cohort entry. For prodromal phenoconverters, entry is years
+# before PD baseline, so it is not their age at PD baseline. Anchor on the first
+# recorded visit, which is the point ENROLL_AGE refers to.
+entry_lookup <- read_excel(config$data, sheet = SH$updrs3) %>%
+  mutate(PATNO = as.character(PATNO), v_month = parse_my_vec(INFODT)) %>%
+  filter(!is.na(v_month)) %>%
+  group_by(PATNO) %>%
+  summarise(entry_month = min(v_month), .groups = "drop")
+
+dem <- dem %>%
+  left_join(entry_lookup, by = "PATNO") %>%
+  mutate(
+    bl_month    = parse_my_vec(PD_Baseline_Date),
+    sx_month    = parse_my_vec(Symptom_Onset_Date),
+    dx_month    = parse_my_vec(PD_Diagnosis_Date),
+    onset_month = coalesce(sx_month, dx_month),
+
+    # age at PD baseline, carried forward from cohort entry. For enrolled PD these
+    # coincide; for phenoconverters PD baseline is the conversion date, years later.
+    Age_baseline = if_else(!is.na(entry_month) & !is.na(bl_month),
+                           as.numeric(ENROLL_AGE) + (bl_month - entry_month) / 12,
+                           as.numeric(ENROLL_AGE)),
+
+    # Phenoconverters carry no onset or diagnosis date because PD_Baseline_Date IS the
+    # conversion date: duration at PD baseline is zero by construction, not missing.
+    # Checked first, so the one phenoconverter who does have an onset date is treated
+    # like the other 55 rather than picking up a prodromal-symptom duration.
+    Duration_bl = case_when(
+      Phenoconverted == 1 & !is.na(bl_month) ~ 0,
+      !is.na(onset_month) & !is.na(bl_month) ~ (bl_month - onset_month) / 12,
+      TRUE ~ NA_real_
+    ),
+
+    # onset = age at PD baseline - duration. No ENROLL_AGE fallback: previously that
+    # silently assigned age at entry, which for phenoconverters understates onset age
+    # by the prodromal interval and implies a duration of zero without saying so.
+    # Both terms are in the models, and onset does not proxy duration: they are two
+    # dimensions of one identity, and duration differs 2.4-fold across cohorts
+    # (SPD 1.8y vs G2019S 4.3y) because the Genetic Registry does not recruit de novo.
+    Age_onset = Age_baseline - Duration_bl
+  )
+
+cat(sprintf("\nPhenoconverters (Duration_bl set to 0): %d\n",
+            sum(dem$Phenoconverted == 1 & !is.na(dem$Duration_bl))))
+cat(sprintf("Dropped, no date and not a phenoconverter: %d\n",
+            sum(is.na(dem$Duration_bl))))
+
+cat("\nBaseline disease duration by cohort (years):\n")
+print(dem %>% group_by(Cohort) %>%
+        summarise(N = n(), mean = round(mean(Duration_bl, na.rm = TRUE), 2),
+                  sd = round(sd(Duration_bl, na.rm = TRUE), 2),
+                  median = round(median(Duration_bl, na.rm = TRUE), 2),
+                  missing = sum(is.na(Duration_bl)), .groups = "drop") %>%
+        as.data.frame())
+
+# the ENROLL_AGE fallback understated onset age for phenoconverters by the prodromal
+# interval; this shows how far, and should be zero for enrolled PD
+cat("\nAge at PD baseline vs age at cohort entry (years):\n")
+print(dem %>%
+        mutate(entry_to_bl = Age_baseline - as.numeric(ENROLL_AGE)) %>%
+        group_by(Cohort, Phenoconverted) %>%
+        summarise(N = n(), mean_gap = round(mean(entry_to_bl, na.rm = TRUE), 2),
+                  max_gap = round(max(entry_to_bl, na.rm = TRUE), 2),
+                  .groups = "drop") %>%
+        as.data.frame())
+
+cat("Exclusion flow:\n")
+cat(sprintf("  All participants:       %d\n", flow$total))
+cat(sprintf("  Valid enrollment:       %d\n", flow$valid_status))
+cat(sprintf("  PD (enrolled + pheno):  %d\n", flow$pd))
+cat(sprintf("  With public WGS:       %d\n", flow$has_wgs))
+cat(sprintf("  Excluded other genes:   %d\n", flow$excl_other_gene))
+cat(sprintf("  After gene exclusions:  %d\n", flow$after_gene_excl))
+cat(sprintf("  Final (4-group):        %d\n", flow$final))
+table(dem$Cohort, useNA = "ifany")
+```
+
+## Participant-Level Variables
+
+```{r table1-vars}
+# original race from raw demographics (pre-collapse for Table 1)
+dem_detail <- read.csv(config$dem_csv)
+dem_detail$PATNO <- as.character(dem_detail$PATNO)
+dem_detail <- dem_detail %>%
+  group_by(PATNO) %>% slice(1) %>% ungroup() %>%
+  mutate(
+    Race_detail = case_when(
+      RAWHITE == 1 & rowSums(cbind(RAASIAN, RABLACK, RAHAWOPI, RAINDALS), na.rm = TRUE) == 0 ~ "White",
+      RABLACK == 1 & rowSums(cbind(RAWHITE, RAASIAN, RAHAWOPI, RAINDALS), na.rm = TRUE) == 0 ~ "Black",
+      RAASIAN == 1 & rowSums(cbind(RAWHITE, RABLACK, RAHAWOPI, RAINDALS), na.rm = TRUE) == 0 ~ "Asian",
+      rowSums(cbind(RAWHITE, RABLACK, RAASIAN, RAHAWOPI, RAINDALS), na.rm = TRUE) > 1 ~ "Multiracial",
+      TRUE ~ "Unknown"
+    )
+  ) %>%
+  select(PATNO, Race_detail)
+dem <- dem %>% left_join(dem_detail, by = "PATNO")
+
+# SAA: prioritize BL, collapse Inconclusive → Unknown
+saa <- read.csv(config$saa_csv)
+saa$PATNO <- as.character(saa$PATNO)
+saa_bl <- saa %>% filter(CLINICAL_EVENT == "BL") %>%
+  group_by(PATNO) %>% slice(1) %>% ungroup() %>%
+  select(PATNO, SAA = SAA_Status)
+saa_any <- saa %>% group_by(PATNO) %>% slice(1) %>% ungroup() %>%
+  select(PATNO, SAA = SAA_Status)
+saa_per_pat <- saa_bl %>%
+  bind_rows(saa_any %>% filter(!PATNO %in% saa_bl$PATNO)) %>%
+  mutate(SAA = if_else(SAA == "Inconclusive", "Unknown", SAA))
+dem <- dem %>% left_join(saa_per_pat, by = "PATNO") %>%
+  mutate(SAA = if_else(is.na(SAA), "Unknown", SAA))
+
+# DBS
+proc <- read.csv(config$proc_csv)
+proc$PATNO <- as.character(proc$PATNO)
+dbs_pats <- unique(proc$PATNO[proc$PDSURGTP == 1])
+dem$DBS <- dem$PATNO %in% dbs_pats
+```
+
+## Clinical Outcomes
+
+```{r shared-prep}
+VALID_IDS <- dem$PATNO
+pheno_ids <- dem$PATNO[dem$Phenoconverted == 1]
+bl_lookup <- dem %>% select(PATNO, bl_month)
+dem_cols  <- c("PATNO", "Cohort", "Age_onset", "Age_baseline", "Duration_bl",
+               "Sex", "Race", "G2019S_homozygous", "Phenoconverted", "has_M1646T")
+
+ledd_log <- read.csv(config$ledd_csv)
+ledd_log$PATNO <- as.character(ledd_log$PATNO)
+
+prep_visits <- function(df) {
+  df$PATNO <- as.character(df$PATNO)
+  df %>%
+    filter(PATNO %in% VALID_IDS) %>%
+    mutate(visit_month = parse_my_vec(INFODT)) %>%
+    left_join(bl_lookup, by = "PATNO") %>%
+    mutate(
+      visit_year = if_else(
+        PATNO %in% pheno_ids & !is.na(visit_month) & !is.na(bl_month),
+        (visit_month - bl_month) / 12,
+        visit_year
+      )
+    ) %>%
+    filter(visit_year >= 0, visit_year <= MAX_YEAR) %>%
+    select(-bl_month)
+}
+
+merge_dem <- function(df, score_col) {
+  df %>%
+    left_join(dem %>% select(all_of(dem_cols)), by = "PATNO") %>%
+    filter(!is.na(Cohort)) %>%
+    rename(participant_id = PATNO, score = !!sym(score_col)) %>%
+    filter(!is.na(score)) %>%
+    group_by(participant_id) %>%
+    mutate(baseline_score = first(score, order_by = visit_year)) %>%
+    ungroup()
+}
+```
+
+```{r updrs3}
+u3_raw <- read_excel(config$data, sheet = SH$updrs3)
+u3_raw <- prep_visits(u3_raw)
+u3_raw$LEDD <- compute_visit_ledd(u3_raw$visit_month, u3_raw$PATNO, ledd_log)
+
+item3_cols <- c("NP3SPCH", "NP3FACXP", "NP3RIGN", "NP3RIGRU", "NP3RIGLU",
+                "NP3RIGRL", "NP3RIGLL", "NP3FTAPR", "NP3FTAPL", "NP3HMOVR",
+                "NP3HMOVL", "NP3PRSPR", "NP3PRSPL", "NP3TTAPR", "NP3TTAPL",
+                "NP3LGAGR", "NP3LGAGL", "NP3RISNG", "NP3GAIT", "NP3FRZGT",
+                "NP3PSTBL", "NP3POSTR", "NP3BRADY", "NP3PTRMR", "NP3PTRML",
+                "NP3KTRMR", "NP3KTRML", "NP3RTARU", "NP3RTALU", "NP3RTARL",
+                "NP3RTALL", "NP3RTALJ", "NP3RTCON")
+for (col in item3_cols)
+  if (col %in% names(u3_raw)) u3_raw[[col]] <- as.numeric(u3_raw[[col]])
+u3_raw <- compute_subscores(u3_raw)
+
+u3_off <- u3_raw %>%
+  filter(PDTRTMNT == "0" | is.na(PDTRTMNT) | PDSTATE == "OFF" | PAG_NAME == "NUPDR3OF") %>%
+  filter(PDSTATE != "ON" | is.na(PDSTATE)) %>%
+  filter(!PAG_NAME %in% c("NUPDR3ON", "NUPDRS3A"))
+
+d_u3_off <- merge_dem(u3_off, "NP3TOT")
+
+cat(sprintf("UPDRS III OFF: %d obs, %d participants\n",
+            nrow(d_u3_off), n_distinct(d_u3_off$participant_id)))
+```
+
+```{r other-outcomes}
+u1_raw <- read_excel(config$data, sheet = SH$updrs1)
+u1_raw <- prep_visits(u1_raw)
+d_u1 <- merge_dem(u1_raw, "NP1TOT")
+
+u2_raw <- read_excel(config$data, sheet = SH$updrs2)
+u2_raw <- prep_visits(u2_raw)
+item2_cols <- c("NP2SPCH", "NP2SALV", "NP2SWAL", "NP2EAT", "NP2DRES",
+                "NP2HYGN", "NP2HWRT", "NP2HOBB", "NP2TURN", "NP2TRMR",
+                "NP2RISE", "NP2WALK", "NP2FREZ")
+for (col in item2_cols)
+  if (col %in% names(u2_raw)) u2_raw[[col]] <- as.numeric(u2_raw[[col]])
+d_u2 <- merge_dem(u2_raw, "NP2PTOT")
+
+u4_raw <- read_excel(config$data, sheet = SH$updrs4)
+u4_raw <- prep_visits(u4_raw)
+d_u4 <- merge_dem(u4_raw, "NP4TOT")
+
+moca_raw <- read_excel(config$data, sheet = SH$moca)
+moca_raw <- prep_visits(moca_raw)
+moca_col <- intersect(c("MCATOT", "MoCA_score"), names(moca_raw))[1]
+moca_raw[[moca_col]] <- as.numeric(moca_raw[[moca_col]])
+d_moca <- merge_dem(moca_raw, moca_col)
+
+dat_raw <- read_excel(config$data, sheet = SH$dat)
+dat_raw$PATNO <- as.character(dat_raw$PATNO)
+dat_raw <- dat_raw %>% filter(PATNO %in% VALID_IDS)
+if (!"INFODT" %in% names(dat_raw) && "DATSCAN_DATE" %in% names(dat_raw))
+  dat_raw$INFODT <- dat_raw$DATSCAN_DATE
+dat_raw <- dat_raw %>%
+  mutate(visit_month = parse_my_vec(INFODT)) %>%
+  left_join(bl_lookup, by = "PATNO") %>%
+  mutate(visit_year = if_else(
+    PATNO %in% pheno_ids & !is.na(visit_month) & !is.na(bl_month),
+    (visit_month - bl_month) / 12, visit_year)) %>%
+  filter(visit_year >= 0, visit_year <= MAX_YEAR) %>% select(-bl_month)
+caudate_mean <- grep("_i$|_c$", grep("caudate", names(dat_raw), value = TRUE, ignore.case = TRUE),
+                     value = TRUE, invert = TRUE)
+putamen_mean <- grep("_i$|_c$", grep("putamen", names(dat_raw), value = TRUE, ignore.case = TRUE),
+                     value = TRUE, invert = TRUE)
+for (col in c(caudate_mean, putamen_mean)) dat_raw[[col]] <- as.numeric(dat_raw[[col]])
+make_dat <- function(col) {
+  dat_raw %>%
+    left_join(dem %>% select(all_of(dem_cols)), by = "PATNO") %>%
+    filter(!is.na(Cohort)) %>%
+    rename(participant_id = PATNO, score = !!sym(col)) %>%
+    filter(!is.na(score)) %>%
+    group_by(participant_id) %>%
+    mutate(baseline_score = first(score, order_by = visit_year)) %>%
+    ungroup()
+}
+d_dat_c <- if (length(caudate_mean)) make_dat(caudate_mean[1]) else NULL
+d_dat_p <- if (length(putamen_mean)) make_dat(putamen_mean[1]) else NULL
+
+cat(sprintf("UPDRS I:  %d obs, %d participants\n", nrow(d_u1), n_distinct(d_u1$participant_id)))
+cat(sprintf("UPDRS II: %d obs, %d participants\n", nrow(d_u2), n_distinct(d_u2$participant_id)))
+cat(sprintf("UPDRS IV: %d obs, %d participants\n", nrow(d_u4), n_distinct(d_u4$participant_id)))
+cat(sprintf("MoCA:     %d obs, %d participants\n", nrow(d_moca), n_distinct(d_moca$participant_id)))
+if (!is.null(d_dat_c))
+  cat(sprintf("DAT Cau:  %d obs, %d participants\n", nrow(d_dat_c), n_distinct(d_dat_c$participant_id)))
+if (!is.null(d_dat_p))
+  cat(sprintf("DAT Put:  %d obs, %d participants\n", nrow(d_dat_p), n_distinct(d_dat_p$participant_id)))
+```
+
+## TD/PIGD Classification
+
+```{r td-pigd}
+bl_u3 <- d_u3_off %>%
+  group_by(participant_id) %>%
+  slice_min(visit_year, n = 1, with_ties = FALSE) %>%
+  ungroup()
+bl_u2 <- u2_raw %>%
+  group_by(PATNO) %>%
+  slice_min(visit_year, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+td_items <- c("NP2TRMR", "NP3PTRMR", "NP3PTRML", "NP3KTRMR", "NP3KTRML",
+              "NP3RTARU", "NP3RTALU", "NP3RTARL", "NP3RTALL", "NP3RTALJ", "NP3RTCON")
+pigd_items_u2 <- c("NP2WALK", "NP2FREZ")
+pigd_items_u3 <- c("NP3GAIT", "NP3FRZGT", "NP3PSTBL")
+
+td_pigd <- bl_u3 %>%
+  select(participant_id, any_of(c(td_items, pigd_items_u3))) %>%
+  left_join(
+    bl_u2 %>% select(PATNO, any_of(c("NP2TRMR", pigd_items_u2))) %>%
+      rename(participant_id = PATNO),
+    by = "participant_id"
+  ) %>%
+  rowwise() %>%
+  mutate(
+    td_mean   = mean(c_across(any_of(td_items)), na.rm = FALSE),
+    pigd_mean = mean(c_across(any_of(c(pigd_items_u2, pigd_items_u3))), na.rm = FALSE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    td_pigd_ratio = if_else(pigd_mean == 0 & td_mean == 0, NA_real_,
+                   if_else(pigd_mean == 0, Inf, td_mean / pigd_mean)),
+    motor_subtype = case_when(
+      is.na(td_pigd_ratio) ~ "Indeterminate",
+      td_pigd_ratio >= 1.15 ~ "TD",
+      td_pigd_ratio <= 0.90 ~ "PIGD",
+      TRUE ~ "Indeterminate"
+    )
+  ) %>%
+  select(participant_id, td_mean, pigd_mean, td_pigd_ratio, motor_subtype)
+table(td_pigd$motor_subtype)
+```
+
+## Output
+
+```{r output}
+dem_out <- dem %>%
+  left_join(td_pigd %>% select(participant_id, motor_subtype),
+            by = c("PATNO" = "participant_id")) %>%
+  select(PATNO, Cohort, Sex, Race, Race_detail, Age_onset, Age_baseline, Duration_bl,
+         G2019S_homozygous, Phenoconverted, has_M1646T,
+         has_G2019S, has_R1441G, has_R1441C,
+         motor_subtype, SAA, DBS, Consensus_LRRK2,
+         PPMI_Cohort, Enrollment_Status,
+         PD_Baseline_Date, Symptom_Onset_Date, PD_Diagnosis_Date)
+
+keep_u3 <- c("participant_id", "EVENT_ID", "INFODT", "visit_year", "visit_month",
+             "PAG_NAME", "PDSTATE", "PDTRTMNT",
+             "score", "baseline_score", "LEDD",
+             "Cohort", "Age_onset", "Duration_bl", "Sex", "Race",
+             "G2019S_homozygous", "Phenoconverted", "has_M1646T",
+             "tremor_score", "rigidity_score", "bradykinesia_score",
+             "axial_score", "bulbar_score", "pigd_score",
+             item3_cols)
+keep_u3 <- keep_u3[keep_u3 %in% names(d_u3_off)]
+keep_other <- c("participant_id", "EVENT_ID", "INFODT", "visit_year",
+                "score", "baseline_score", "Cohort", "Age_onset", "Duration_bl",
+                "Sex", "Race")
+
+wb <- createWorkbook()
+addWorksheet(wb, "Participants");       writeData(wb, "Participants", dem_out)
+addWorksheet(wb, "UPDRS_III_OFF");      writeData(wb, "UPDRS_III_OFF", d_u3_off %>% select(any_of(keep_u3)))
+addWorksheet(wb, "UPDRS_I");            writeData(wb, "UPDRS_I", d_u1 %>% select(any_of(keep_other)))
+addWorksheet(wb, "UPDRS_II");           writeData(wb, "UPDRS_II", d_u2 %>% select(any_of(keep_other)))
+addWorksheet(wb, "UPDRS_IV");           writeData(wb, "UPDRS_IV", d_u4 %>% select(any_of(keep_other)))
+addWorksheet(wb, "MoCA");              writeData(wb, "MoCA", d_moca %>% select(any_of(keep_other)))
+if (!is.null(d_dat_c)) { addWorksheet(wb, "DAT_Caudate"); writeData(wb, "DAT_Caudate", d_dat_c %>% select(any_of(keep_other))) }
+if (!is.null(d_dat_p)) { addWorksheet(wb, "DAT_Putamen"); writeData(wb, "DAT_Putamen", d_dat_p %>% select(any_of(keep_other))) }
+addWorksheet(wb, "TD_PIGD");           writeData(wb, "TD_PIGD", td_pigd)
+saveWorkbook(wb, config$out, overwrite = TRUE)
+cat(sprintf("Saved: %s\n", config$out))
+```
+
+## Summary
+
+```{r summary}
+cat("Exclusion flow:\n")
+cat(sprintf("  All participants:       %d\n", flow$total))
+cat(sprintf("  Valid enrollment:       %d\n", flow$valid_status))
+cat(sprintf("  PD (enrolled + pheno):  %d\n", flow$pd))
+cat(sprintf("  With public WGS:       %d\n", flow$has_wgs))
+cat(sprintf("  Excluded other genes:   %d\n", flow$excl_other_gene))
+cat(sprintf("  After gene exclusions:  %d\n", flow$after_gene_excl))
+cat(sprintf("  Final (4-group):        %d\n", flow$final))
+table(dem$Cohort, useNA = "ifany")
+```
+
+```{r session}
+sessionInfo()
+```
