@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 title: >-
-  Variant-specific motor symptom progression in
-  LRRK2-associated Parkinson's disease
+  The LRRK2 R1441G+M1646T haplotype is associated with slower 
+motor symptom progression in Parkinson's disease.
 message: >-
   Publication pending. Please cite this repository until
   the peer-reviewed article is published.
@@ -40,8 +40,8 @@ license: Apache-2.0
 preferred-citation:
   type: article
   title: >-
-    Variant-specific motor symptom progression in
-    LRRK2-associated Parkinson's disease
+    The LRRK2 R1441G+M1646T haplotype is associated with slower 
+motor symptom progression in Parkinson's disease.
   authors:
     - given-names: Jackson G.
       family-names: Schumacher
