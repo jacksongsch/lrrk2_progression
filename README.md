@@ -2,9 +2,9 @@
 
 Schumacher JG, Zhang X, Wang J, Chen X.
 
-**Preprint:** 
+**Preprint:** [10.64898/2026.08.26.26361428](https://doi.org/10.64898/2026.08.26.26361428)
 
-**Published article:** 
+**Published article:** Under review
 
 ---
 
@@ -171,7 +171,7 @@ directory. Outputs are written to `Output/`.
 
 ## Citation
 
-Publication pending. Please cite this repository until the peer-reviewed
+Publication pending. Please cite this repository and the preprint until the peer-reviewed
 article is published:
 
 ```bibtex
@@ -181,7 +181,7 @@ article is published:
   author  = {Schumacher, Jackson G. and Zhang, Xinyuan and Wang, Jian
              and Chen, Xiqun},
   year    = {2026},
-  note    = {Manuscript in preparation}
+  note    = {Under review}
 }
 ```
 
